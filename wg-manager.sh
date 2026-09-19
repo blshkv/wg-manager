@@ -1,13 +1,18 @@
 #!/bin/bash -e
+set -o pipefail
 
-APP=$(basename $0)
-LOCKFILE="/tmp/$APP.lock"
+HOME_DIR="/etc/wireguard"
 
-trap "rm -f ${LOCKFILE}; exit" INT TERM EXIT
-if ! ln -s $APP $LOCKFILE 2>/dev/null; then
+APP=$(basename "$0")
+LOCKFILE="${HOME_DIR}/.${APP}.lock"
+
+# Acquire the lock before installing the cleanup trap, otherwise a process
+# that loses the race would remove the winner's lockfile on its own exit.
+if ! ln -s "$APP" "$LOCKFILE" 2>/dev/null; then
     echo "ERROR: script LOCKED" >&2
     exit 15
 fi
+trap 'rc=$?; rm -f "$LOCKFILE"; exit $rc' INT TERM EXIT
 
 function usage {
   echo "Usage: $0 [<options>] [command [arg]]"
@@ -29,11 +34,13 @@ function usage {
 unset USER
 umask 0077
 
-HOME_DIR="/etc/wireguard"
 SERVER_NAME="wg-server"
 SERVER_IP_PREFIX="10.10.10"
 SERVER_PORT=39547
-SERVER_INTERFACE=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
+# No default route is a valid (if unusual) state here -- init() checks for
+# and reports an empty SERVER_INTERFACE later, so don't let pipefail abort
+# the whole script over it.
+SERVER_INTERFACE=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1) || true
 
 while getopts ":icdpqhLUu:I:s:" opt; do
   case $opt in
@@ -55,6 +62,24 @@ done
 
 [ $# -lt 1 ] && usage
 
+# USER ends up in filesystem paths (keys/${USER}, including rm -rf) and in a
+# sed range/regex, so it must be restricted to a safe identifier charset --
+# otherwise a value like "../../etc" or embedded regex/newline chars can
+# escape the keys/ directory or corrupt the server config.
+if [ -n "${USER}" ] && [[ ! "${USER}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    echo "ERROR: invalid user identifier '${USER}' (allowed: letters, digits, '.', '_', '-')" >&2
+    exit 1
+fi
+
+ACTIONS=0
+for _flag in "$INIT" "$CREATE" "$DELETE" "$LOCK" "$UNLOCK" "$PRINT_USER_CONFIG" "$PRINT_QR_CODE"; do
+    [ -n "$_flag" ] && ACTIONS=$((ACTIONS + 1))
+done
+if [ "$ACTIONS" -gt 1 ]; then
+    echo "ERROR: only one of -i/-c/-d/-L/-U/-p/-q may be given at a time" >&2
+    exit 1
+fi
+
 function reload_server {
     wg syncconf ${SERVER_NAME} <(wg-quick strip ${SERVER_NAME})
 }
@@ -62,22 +87,26 @@ function reload_server {
 function get_new_ip {
     declare -A IP_EXISTS
 
-    for IP in $(grep -i 'Address\s*=\s*' keys/*/*.conf | sed 's/\/[0-9]\+$//' | grep -Po '\d+$')
+    for IP in $(grep -i 'Address\s*=\s*' keys/*/*.conf 2>/dev/null | sed 's/\/[0-9]\+$//' | grep -Po '\d+$')
     do
         IP_EXISTS[$IP]=1
     done
 
+    local FOUND=""
     for IP in {2..255}
     do
-        [ ${IP_EXISTS[$IP]} ] || break
+        if [ -z "${IP_EXISTS[$IP]}" ]; then
+            FOUND=$IP
+            break
+        fi
     done
 
-    if [ $IP -eq 255 ]; then
+    if [ -z "$FOUND" ]; then
         echo "ERROR: can't determine new address" >&2
         exit 3
     fi
 
-    echo "${SERVER_IP_PREFIX}.${IP}/32"
+    echo "${SERVER_IP_PREFIX}.${FOUND}/32"
 }
 
 function add_user_to_server {
@@ -86,12 +115,13 @@ function add_user_to_server {
         exit 1
     fi
 
-    local USER_PUB_KEY=$(cat "keys/${USER}/public.key")
-    local USER_IP=$(grep -i Address "keys/${USER}/${USER}.conf" | sed 's/Address\s*=\s*//i; s/\/.*//')
+    local USER_PUB_KEY USER_IP
+    USER_PUB_KEY=$(cat "keys/${USER}/public.key")
+    USER_IP=$(grep -i Address "keys/${USER}/${USER}.conf" | sed 's/Address\s*=\s*//i; s/\/.*//')
 
     if grep "# BEGIN ${USER}$" "$SERVER_NAME.conf" >/dev/null ; then
         echo "User already exists"
-        exit 0
+        return 0
     fi
 
 cat <<EOF >> "$SERVER_NAME.conf"
@@ -108,7 +138,8 @@ EOF
 function remove_user_from_server {
     sed -i "/# BEGIN ${USER}$/,/# END ${USER}$/d" "$SERVER_NAME.conf"
     if [ -f "keys/${USER}/${USER}.conf" ]; then
-        local USER_IP=$(grep -i Address "keys/${USER}/${USER}.conf" | sed 's/Address\s*=\s*//i; s/\/.*//')
+        local USER_IP
+        USER_IP=$(grep -i Address "keys/${USER}/${USER}.conf" | sed 's/Address\s*=\s*//i; s/\/.*//')
         ip -4 route del ${USER_IP}/32 dev ${SERVER_NAME} || true
     fi
 }
@@ -153,11 +184,11 @@ PostDown = iptables -t nat -D POSTROUTING -o ${SERVER_INTERFACE} -j MASQUERADE
 
 EOF
 
-    echo net.ipv4.ip_forward=1 >> /etc/sysctl.conf
+    grep -qxF 'net.ipv4.ip_forward=1' /etc/sysctl.conf || echo net.ipv4.ip_forward=1 >> /etc/sysctl.conf
     sysctl -p
 
     systemctl enable wg-quick@${SERVER_NAME}
-    wg-quick up ${SERVER_NAME} || true
+    wg-quick up ${SERVER_NAME}
 
     echo "Server initialized successfully"
     exit 0
@@ -172,7 +203,7 @@ function create {
     SERVER_ENDPOINT=$(cat "keys/.server")
     USER_IP=$( get_new_ip )
 
-    mkdir "keys/${USER}"
+    mkdir -p "keys/${USER}"
     wg genkey | tee "keys/${USER}/private.key" | wg pubkey > "keys/${USER}/public.key"
 
     USER_PVT_KEY=$(cat "keys/${USER}/private.key")
