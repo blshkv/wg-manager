@@ -229,6 +229,19 @@ EOF
 
 cd $HOME_DIR
 
+# Once the server is initialized, trust its live wg-server.conf over the
+# SERVER_IP_PREFIX/SERVER_PORT defaults declared above -- those defaults are
+# only used to generate a brand new config during -i. This lets the script
+# adopt an existing server whose subnet/port don't match the defaults,
+# without editing the script.
+if [ -f "$SERVER_NAME.conf" ]; then
+    SERVER_ADDRESS=$(grep -i '^\s*Address' "$SERVER_NAME.conf" | head -1 | sed -E 's/^\s*[Aa]ddress\s*=\s*//; s#/.*##')
+    [ -n "$SERVER_ADDRESS" ] && SERVER_IP_PREFIX="${SERVER_ADDRESS%.*}"
+
+    SERVER_PORT_CONF=$(grep -i '^\s*ListenPort' "$SERVER_NAME.conf" | head -1 | sed -E 's/^\s*[Ll]istenPort\s*=\s*//')
+    [ -n "$SERVER_PORT_CONF" ] && SERVER_PORT="$SERVER_PORT_CONF"
+fi
+
 if [ $INIT ]; then
     init
     exit 0;
