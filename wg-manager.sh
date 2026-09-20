@@ -34,7 +34,7 @@ function usage {
 unset USER
 umask 0077
 
-SERVER_NAME="wg-server"
+SERVER_NAME="wg0"
 SERVER_IP_PREFIX="10.10.10"
 SERVER_PORT=39547
 # No default route is a valid (if unusual) state here -- init() checks for
@@ -229,7 +229,7 @@ EOF
 
 cd $HOME_DIR
 
-# Once the server is initialized, trust its live wg-server.conf over the
+# Once the server is initialized, trust its live ${SERVER_NAME}.conf over the
 # SERVER_IP_PREFIX/SERVER_PORT defaults declared above -- those defaults are
 # only used to generate a brand new config during -i. This lets the script
 # adopt an existing server whose subnet/port don't match the defaults,
